@@ -1,17 +1,12 @@
 
-from __future__ import annotations
-
 import argparse
 import math
 import sys
+import os
+import networkx as nx
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-try:
-    import networkx as nx
-except ImportError as e:
-    print("This script requires networkx. Install with `pip install networkx matplotlib`.", file=sys.stderr)
-    raise
 
 # Matplotlib is optional unless --plot is passed
 try:
@@ -19,10 +14,7 @@ try:
 except Exception:  # pragma: no cover
     plt = None
 
-
-ValKeyCandidates: Sequence[str] = ("valuation", "value", "weight")
-
-
+# Market class for easier variable transport between functions
 @dataclass
 class Market:
     G: nx.Graph
@@ -32,13 +24,9 @@ class Market:
     prices: Dict[int, float]
     valkey: str
 
-
-# ------------------------------
-# Loading and validation helpers
-# ------------------------------
-
+# loads the market from the gml and formats it into the Market Class object
 def load_market(path: str) -> Market:
-    import os
+    # Checks if the file exists and opens
     if not os.path.exists(path):
         raise FileNotFoundError(f"Input file not found: {path}")
     try:
@@ -46,11 +34,11 @@ def load_market(path: str) -> Market:
     except Exception as e:
         raise ValueError(f"Failed to read GML: {e}")
 
-    # Ensure undirected for our use; valuations are read from edges regardless of orientation
+    # Makes sure it is undirected graph object
     if isinstance(G, nx.DiGraph):
         G = nx.Graph(G.to_undirected())
 
-    # Node ids should be integers 0..2n-1
+    # Following checks that input graph is valid along constraints and format
     try:
         node_ids = sorted(int(u) for u in G.nodes())
     except Exception:
@@ -59,8 +47,7 @@ def load_market(path: str) -> Market:
         raise ValueError("Graph has no nodes.")
     if node_ids[0] != 0:
         raise ValueError("Smallest node id must be 0.")
-    max_id = node_ids[-1]
-    m = max_id + 1
+    m= len(G.nodes)# node_ids[-1] 
     if m % 2 != 0:
         raise ValueError("Number of nodes must be even (2n).")
     n = m // 2
@@ -68,22 +55,9 @@ def load_market(path: str) -> Market:
     if node_ids != expected_ids:
         raise ValueError("Node ids must be exactly 0..(2n-1) with no gaps.")
 
-    sellers = list(range(0, n))
-    buyers = list(range(n, 2 * n))
-
-    # Determine valuation key by inspecting the first edge that has a matching key
-    found_key: Optional[str] = None
-    for (u, v, data) in G.edges(data=True):
-        for k in ValKeyCandidates:
-            if k in data:
-                found_key = k
-                break
-        if found_key:
-            break
-    if not found_key:
-        raise ValueError(
-            f"Edges must carry a valuation attribute (one of {list(ValKeyCandidates)})."
-        )
+    # Organizes our sellers and buyers in lists
+    sellers = list(range(0, m // 2))
+    buyers = list(range(m // 2, m))
 
     # Initialize prices from seller node attributes, default 0.0
     prices: Dict[int, float] = {}
@@ -94,34 +68,17 @@ def load_market(path: str) -> Market:
             raise ValueError(f"Invalid price on seller node {a}: {p}")
         prices[a] = p
 
-    return Market(G=G, sellers=sellers, buyers=buyers, n=n, prices=prices, valkey=found_key)
+    return Market(G=G, sellers=sellers, buyers=buyers, n=n, prices=prices, valkey="valuation")
 
-
-# ------------------------------
-# Core market-clearing procedures
-# ------------------------------
-
+# just grabs the valuation of the edge
 def valuation(mkt: Market, buyer: int, seller: int) -> float:
-    """Return valuation v_{buyer, seller}. If no edge, treat as -inf (unavailable)."""
     data = mkt.G.get_edge_data(buyer, seller, default=None)
-    if data is None:
-        return float("-inf")
     val = data.get(mkt.valkey, None)
-    if val is None:
-        return float("-inf")
-    try:
-        return float(val)
-    except Exception:
-        raise ValueError(f"Non-numeric valuation on edge ({buyer}, {seller}).")
+    return float(val)
 
-
+# Returns a graph with only the preferred edges on display
+# Returns a dictionary that maps each buyer to it's preferred seller
 def build_demand_graph(mkt: Market) -> Tuple[nx.Graph, Dict[int, float]]:
-    """Construct preference (demand) graph at current prices.
-
-    For each buyer i in B, compute s_i(j) = v(i,j) - p_j. Keep edges to sellers achieving
-    the maximum nonnegative surplus. Return the demand graph and a dict of each buyer's
-    max surplus value.
-    """
     H = nx.Graph()
     H.add_nodes_from(mkt.buyers, bipartite=0)
     H.add_nodes_from(mkt.sellers, bipartite=1)
@@ -151,7 +108,7 @@ def build_demand_graph(mkt: Market) -> Tuple[nx.Graph, Dict[int, float]]:
             max_surplus[i] = best  # negative; no edges added for this buyer
     return H, max_surplus
 
-
+# Returns list of unique sellers from preferred graph
 def maximum_matching_on_demand(H: nx.Graph, buyers: List[int]) -> Dict[int, int]:
     """Return matching as mapping buyer->seller for the demand graph."""
     if H.number_of_nodes() == 0:
@@ -165,7 +122,7 @@ def maximum_matching_on_demand(H: nx.Graph, buyers: List[int]) -> Dict[int, int]
             match[i] = j
     return match
 
-
+# Finds the constricted sets
 def alternating_bfs_constricted_set(H: nx.Graph, buyers: List[int], match: Dict[int, int]) -> Tuple[Set[int], Set[int]]:
     """Compute (R, S) via alternating BFS from unmatched buyers.
 
@@ -204,60 +161,22 @@ def alternating_bfs_constricted_set(H: nx.Graph, buyers: List[int], match: Dict[
             pass
     return R, S
 
-
-def compute_epsilon(mkt: Market, R: Set[int], S: Set[int]) -> float:
-    """Smallest price increase ε on sellers in S so that some buyer in R becomes
-    indifferent with a seller outside S (causing demand to expand) or an edge appears.
-
-    ε = min_{i in R} [ max_{j in S} (v_ij - p_j) - max_{k not in S} (v_ik - p_k) ]_+.
-    If a buyer has no seller outside S, we ignore them (treated as +inf).
-    """
-    eps = float("inf")
-    for i in R:
-        best_in_S = float("-inf")
-        best_out_S = float("-inf")
-        for j in mkt.sellers:
-            vij = valuation(mkt, i, j)
-            if vij == float("-inf"):
-                continue
-            s = vij - mkt.prices[j]
-            if j in S:
-                if s > best_in_S:
-                    best_in_S = s
-            else:
-                if s > best_out_S:
-                    best_out_S = s
-        if best_out_S == float("-inf"):
-            # no outside option; ignore this i
-            continue
-        gap = best_in_S - best_out_S
-        if gap > 1e-12 and gap < eps:
-            eps = gap
-    if eps == float("inf") or eps <= 0:
-        # fallback: tiny positive step to avoid stalling if numerics are weird
-        eps = 1e-6
-    return eps
-
-
-# ------------------------------
-# Plotting utilities
-# ------------------------------
-
-def maybe_draw(H: nx.Graph, buyers: List[int], sellers: List[int], match: Dict[int, int], prices: Dict[int, float], title: str):
+# Plots the graphs of each round
+def plotting(H: nx.Graph, buyers: List[int], sellers: List[int], match: Dict[int, int], prices: Dict[int, float], title: str):
     if plt is None:
         return
     pos = {}
     # bipartite layout: buyers on left (x=0), sellers on right (x=1)
-    y_b = list(range(len(buyers)))
-    y_s = list(range(len(sellers)))
-    for k, i in enumerate(sorted(buyers)):
+    y_b = list(range(len(sellers)))
+    y_s = list(range(len(buyers)))
+    for k, i in enumerate(sorted(sellers)):
         pos[i] = (0, -k)
-    for k, j in enumerate(sorted(sellers)):
+    for k, j in enumerate(sorted(buyers)):
         pos[j] = (1, -k)
 
     plt.figure()
-    nx.draw_networkx_nodes(H, pos, nodelist=buyers, node_shape='s')
-    nx.draw_networkx_nodes(H, pos, nodelist=sellers, node_shape='o')
+    nx.draw_networkx_nodes(H, pos, nodelist=sellers, node_shape='s')
+    nx.draw_networkx_nodes(H, pos, nodelist=buyers, node_shape='o')
     nx.draw_networkx_edges(H, pos, alpha=0.5)
 
     # Highlight matching edges
@@ -272,17 +191,13 @@ def maybe_draw(H: nx.Graph, buyers: List[int], sellers: List[int], match: Dict[i
     plt.axis('off')
     plt.title(title)
     plt.tight_layout()
-    plt.show(block=False)
-    plt.pause(0.5)
+    plt.show()
 
-
-# ------------------------------
-# Main iterative solver
-# ------------------------------
-
-def solve_market(mkt: Market, do_plot: bool, interactive: bool, max_rounds: int = 5000) -> Tuple[Dict[int, int], Dict[int, float], int]:
+# Solves the market by running through all rounds
+def solve_market(mkt: Market, do_plot: bool, interactive: bool):
     round_no = 0
     last_match_size = -1
+    max_rounds = 20
 
     while round_no < max_rounds:
         round_no += 1
@@ -296,9 +211,7 @@ def solve_market(mkt: Market, do_plot: bool, interactive: bool, max_rounds: int 
             print("Matching size:", match_size, "/", mkt.n)
             if match_size:
                 print("Matching (buyer->seller):", dict(sorted(match.items())))
-
-        if do_plot:
-            maybe_draw(H, mkt.buyers, mkt.sellers, match, mkt.prices, title=f"Demand graph — round {round_no} (|M|={match_size})")
+            plotting(H, mkt.buyers, mkt.sellers, match, mkt.prices, title=f"Round: {round_no} (|M|={match_size})")
 
         if match_size == mkt.n:
             if interactive:
@@ -312,56 +225,58 @@ def solve_market(mkt: Market, do_plot: bool, interactive: bool, max_rounds: int 
             print("Reachable buyers R:", sorted(R))
             print("Constricted sellers S:", sorted(S))
 
-        # If S is empty (can happen if unmatched buyers have no edges), try to add tiny epsilon to all sellers
-        if not S:
-            eps = 1e-6
-        else:
-            eps = compute_epsilon(mkt, R, S)
-        if interactive:
-            print(f"Epsilon price increase: {eps:.6g}")
-
-        # Update prices
+        # Update prices by 1 each round
         for j in S if S else mkt.sellers:
-            mkt.prices[j] = mkt.prices.get(j, 0.0) + eps
-
-        # Convergence guard: if nothing changes in matching size for too long
-        if match_size == last_match_size:
-            pass
-        last_match_size = match_size
+            mkt.prices[j] = mkt.prices.get(j, 0.0) + 1
 
     raise RuntimeError(f"Did not converge within {max_rounds} rounds. Consider checking the input graph.")
 
-
-# ------------------------------
-# CLI
-# ------------------------------
-
-def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Market-clearing via ascending auction on a bipartite graph (GML)")
-    p.add_argument("gml", help="Path to market.gml (Graph Modelling Language)")
-    p.add_argument("--plot", action="store_true", help="Plot the demand graph each round")
-    p.add_argument("--interactive", action="store_true", help="Verbose round-by-round output")
-    p.add_argument("--max-rounds", type=int, default=5000, help="Iteration cap (default: 5000)")
-    p.add_argument("--debug", action="store_true", help="Show full traceback on errors")
-    return p.parse_args(argv)
-
-
+# Main function start
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    import traceback
-    args = parse_args(argv)
+    # Load the Arguments
+    p = argparse.ArgumentParser()
+    p.add_argument("gml")
+    p.add_argument("--plot", action="store_true")
+    p.add_argument("--interactive", action="store_true")
+    args = p.parse_args(argv)
+
+    # Checks to see if the gml file loaded, and loads the sellers and buyers into the mkt variable
     try:
         mkt = load_market(args.gml)
     except Exception as e:
-        if args.debug:
-            traceback.print_exc()
         print(f"Error: {e}", file=sys.stderr)
         return 2
+    G = mkt.G
+    
+    # Plots graph if flag is on
+    if args.plot:
+        # Create positions for bipartite layout
+        pos = {}
+        pos.update((n, (0, i)) for i, n in enumerate(mkt.sellers))  # sellers on left
+        pos.update((n, (1, i)) for i, n in enumerate(mkt.buyers))  # buyers on right
 
+        # Draw nodes
+        nx.draw_networkx_nodes(G, pos, nodelist=mkt.sellers, node_color="skyblue", node_size=800, label="Sellers")
+        nx.draw_networkx_nodes(G, pos, nodelist=mkt.buyers, node_color="lightgreen", node_size=800, label="Buyers")
+
+        # Draw edges with valuation labels
+        nx.draw_networkx_edges(G, pos)
+        edge_labels = nx.get_edge_attributes(G, "valuation")
+        nx.draw_networkx_edge_labels(G, pos, label_pos=0.75, edge_labels=edge_labels, font_size=8)
+
+        # Draw node labels
+        nx.draw_networkx_labels(G, pos)
+
+        # Title and layout
+        plt.title("Bipartite Market Graph (Sellers vs Buyers)")
+        plt.axis("off")
+        plt.tight_layout()
+        plt.show()
+
+    # Solves the market round by round, also shows it if the interactive flag is checked
     try:
-        match, prices, rounds = solve_market(mkt, do_plot=args.plot, interactive=args.interactive, max_rounds=args.max_rounds)
+        match, prices, rounds = solve_market(mkt, do_plot=args.plot, interactive=args.interactive)
     except Exception as e:
-        if args.debug:
-            traceback.print_exc()
         print(f"Error during solving: {e}", file=sys.stderr)
         return 3
 
@@ -370,15 +285,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"Rounds: {rounds}")
     print("Final prices:", {j: round(p, 4) for j, p in sorted(prices.items())})
     print("Final matching (buyer->seller):", dict(sorted(match.items())))
-
-    # Compute total surplus at final prices for reporting
-    total_value = 0.0
-    for i, j in match.items():
-        v = valuation(mkt, i, j)
-        total_value += v
-    revenue = sum(prices.values())
-    print(f"Total value of matched pairs: {total_value:.4f}")
-    print(f"Sum of seller prices: {revenue:.4f}")
 
     return 0
 
