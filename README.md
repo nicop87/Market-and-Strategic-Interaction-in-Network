@@ -8,3 +8,5 @@ When creating the `gml` file, please make sure the seller nodes have the attribu
 The `--plot` flag will display an image of the nodes with all edges visible.
 
 The `--interactive` flag will display a graph with only the preferred paths, and it will show every round. 
+
+Example command: python ./market_strategy.py market.gml --plot --interactive
